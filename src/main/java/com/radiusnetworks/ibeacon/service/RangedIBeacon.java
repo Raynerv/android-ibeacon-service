@@ -1,4 +1,4 @@
-package com.radiusnetworks.ibeacon.client;
+package com.radiusnetworks.ibeacon.service;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -13,17 +13,35 @@ import com.radiusnetworks.ibeacon.IBeaconManager;
 
 public class RangedIBeacon extends IBeacon{
 	private static String TAG = "RangedIBeacon";
-	public static long DEFAULT_SAMPLE_EXPIRATION_MILLISECONDS = 5000;
-	private long sampleExpirationMilliseconds = DEFAULT_SAMPLE_EXPIRATION_MILLISECONDS;
+	public static long DEFAULT_SAMPLE_EXPIRATION_MILLISECONDS = 20000; /* 20 seconds */
+	private static long sampleExpirationMilliseconds = DEFAULT_SAMPLE_EXPIRATION_MILLISECONDS;
+    private boolean tracked = true;
 	public RangedIBeacon(IBeacon ibeacon) {
 		super(ibeacon);
 		addMeasurement(this.rssi);
 	}
-	
-	public void setSampleExpirationMilliseconds(long milliseconds) {
+
+    public boolean isTracked() {
+        return tracked;
+    }
+
+    public void setTracked(boolean tracked) {
+        this.tracked = tracked;
+    }
+
+    // Done at the end of each cycle before data are sent to the client
+    public void commitMeasurements() {
+        runningAverageRssi = calculateRunningAverage();
+        if (IBeaconManager.debug) Log.d(TAG, "calculated new runningAverageRssi:"+runningAverageRssi);
+        accuracy = null; // force calculation of accuracy and proximity next time they are requested
+        proximity = null;
+    }
+
+	public static void setSampleExpirationMilliseconds(long milliseconds) {
 		sampleExpirationMilliseconds = milliseconds;
 	}
 	public void addMeasurement(Integer rssi) {
+            tracked = true;
 			Measurement measurement = new Measurement();
 			measurement.rssi = rssi;
 			measurement.timestamp = new Date().getTime();
@@ -31,11 +49,10 @@ public class RangedIBeacon extends IBeacon{
 	}
 	private ArrayList<Measurement> measurements = new ArrayList<Measurement>();
 	
-	public boolean allMeasurementsExpired() {
-		refreshMeasurements();
+	public boolean noMeasurementsAvailable() {
 		return measurements.size() == 0;
 	}
-	
+
 	private class Measurement implements Comparable<Measurement> {
 		Integer rssi;
 		long timestamp;
@@ -75,7 +92,7 @@ public class RangedIBeacon extends IBeacon{
 		}
 		double runningAverage = sum/(endIndex-startIndex+1);
 
-		if (IBeaconManager.LOG_DEBUG) Log.d(TAG, "Running average rssi based on "+size+" measurements: "+runningAverage);
+		if (IBeaconManager.debug) Log.d(TAG, "Running average rssi based on "+size+" measurements: "+runningAverage);
 		return runningAverage;
 
 	}
@@ -83,10 +100,6 @@ public class RangedIBeacon extends IBeacon{
 	protected void addRangeMeasurement(Integer rssi) {
 		this.rssi = rssi;
 		addMeasurement(rssi);
-		if (IBeaconManager.LOG_DEBUG) Log.d(TAG, "calculating new range measurement with new rssi measurement:"+rssi);
-		runningAverageRssi = calculateRunningAverage();
-		accuracy = null; // force calculation of accuracy and proximity next time they are requested
-		proximity = null;
 	}
 
 	

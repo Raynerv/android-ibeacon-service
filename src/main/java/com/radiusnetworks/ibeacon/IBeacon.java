@@ -23,10 +23,11 @@
  */
 package com.radiusnetworks.ibeacon;
 
-import com.radiusnetworks.ibeacon.client.DataProviderException;
 import com.radiusnetworks.ibeacon.client.IBeaconDataFactory;
 import com.radiusnetworks.ibeacon.client.NullIBeaconDataFactory;
 
+import android.annotation.TargetApi;
+import android.bluetooth.BluetoothDevice;
 import android.util.Log;
 
 /**
@@ -110,6 +111,11 @@ public class IBeacon {
 	 * it is transmitted with each packet to aid in the distance estimate
 	 */
 	protected int txPower;
+
+    /**
+     * The bluetooth mac address
+     */
+    protected String bluetoothAddress;
 	
 	/**
 	 * If multiple RSSI samples were available, this is the running average
@@ -127,7 +133,14 @@ public class IBeacon {
 	 */
 	public double getAccuracy() {
 		if (accuracy == null) {
-			accuracy = calculateAccuracy(txPower, runningAverageRssi != null ? runningAverageRssi : rssi );		
+            double bestRssiAvailable = rssi;
+            if (runningAverageRssi != null) {
+                bestRssiAvailable = runningAverageRssi;
+            }
+            else {
+                if (IBeaconManager.debug) Log.d(TAG, "Not using running average RSSI because it is null");
+            }
+			accuracy = calculateAccuracy(txPower, bestRssiAvailable );
 		}
 		return accuracy;
 	}
@@ -177,7 +190,16 @@ public class IBeacon {
 	public String getProximityUuid() {
 		return proximityUuid;
 	}
-	
+
+    /**
+     * @see #bluetoothAddress
+     * @return bluetoothAddress
+     */
+    public String getBluetoothAddress() {
+        return bluetoothAddress;
+    }
+
+
 	@Override
 	public int hashCode() {
 		return minor;
@@ -194,20 +216,33 @@ public class IBeacon {
 		IBeacon thatIBeacon = (IBeacon) that;		
 		return (thatIBeacon.getMajor() == this.getMajor() && thatIBeacon.getMinor() == this.getMinor() && thatIBeacon.getProximityUuid().equals(this.getProximityUuid()));
 	}
+
+    /**
+     * Construct an iBeacon from a Bluetooth LE packet collected by Android's Bluetooth APIs
+     *
+     * @param scanData The actual packet bytes
+     * @param rssi The measured signal strength of the packet
+     * @return An instance of an <code>IBeacon</code>
+     */
+    public static IBeacon fromScanData(byte[] scanData, int rssi) {
+        return fromScanData(scanData, rssi, null);
+    }
+
 	/**
-	 * Construct an iBeacon from a Bluetooth LE packet collected by Android's Bluetooth APIs
+	 * Construct an iBeacon from a Bluetooth LE packet collected by Android's Bluetooth APIs,
+     * including the raw bluetooth device info
 	 * 
 	 * @param scanData The actual packet bytes
 	 * @param rssi The measured signal strength of the packet
+     * @param device The bluetooth device that was detected
 	 * @return An instance of an <code>IBeacon</code>
 	 */
-	public static IBeacon fromScanData(byte[] scanData, int rssi) {
+    @TargetApi(5)
+	public static IBeacon fromScanData(byte[] scanData, int rssi, BluetoothDevice device) {
 		int startByte = 2;
 		boolean patternFound = false;
 		while (startByte <= 5) {
-			if (((int)scanData[startByte] & 0xff) == 0x4c &&
-				((int)scanData[startByte+1] & 0xff) == 0x00 &&
-				((int)scanData[startByte+2] & 0xff) == 0x02 &&
+			if (((int)scanData[startByte+2] & 0xff) == 0x02 &&
 				((int)scanData[startByte+3] & 0xff) == 0x15) {			
 				// yes!  This is an iBeacon	
 				patternFound = true;
@@ -216,22 +251,34 @@ public class IBeacon {
 			else if (((int)scanData[startByte] & 0xff) == 0x2d &&
 					((int)scanData[startByte+1] & 0xff) == 0x24 &&
 					((int)scanData[startByte+2] & 0xff) == 0xbf &&
-					((int)scanData[startByte+3] & 0xff) == 0x16) {	
-				// this is an Estimote beacon
-				IBeacon iBeacon = new IBeacon();
+					((int)scanData[startByte+3] & 0xff) == 0x16) {
+                if (IBeaconManager.debug) Log.d(TAG, "This is a proprietary Estimote beacon advertisement that does not meet the iBeacon standard.  Identifiers cannot be read.");
+                IBeacon iBeacon = new IBeacon();
 				iBeacon.major = 0;
 				iBeacon.minor = 0;
 				iBeacon.proximityUuid = "00000000-0000-0000-0000-000000000000";
 				iBeacon.txPower = -55;
 				return iBeacon;
-			}					
+			}
+            else if (((int)scanData[startByte] & 0xff) == 0xad &&
+                     ((int)scanData[startByte+1] & 0xff) == 0x77 &&
+                     ((int)scanData[startByte+2] & 0xff) == 0x00 &&
+                     ((int)scanData[startByte+3] & 0xff) == 0xc6) {
+                    if (IBeaconManager.debug) Log.d(TAG, "This is a proprietary Gimbal beacon advertisement that does not meet the iBeacon standard.  Identifiers cannot be read.");
+                    IBeacon iBeacon = new IBeacon();
+                    iBeacon.major = 0;
+                    iBeacon.minor = 0;
+                    iBeacon.proximityUuid = "00000000-0000-0000-0000-000000000000";
+                    iBeacon.txPower = -55;
+                    return iBeacon;
+            }
 			startByte++;
 		}
 		
 
 		if (patternFound == false) {
 			// This is not an iBeacon
-			if (IBeaconManager.LOG_DEBUG) Log.d(TAG, "This is not an iBeacon advertisment (no 4c000215 seen in bytes 2-5).  The bytes I see are: "+bytesToHex(scanData));
+			if (IBeaconManager.debug) Log.d(TAG, "This is not an iBeacon advertisment (no 0215 seen in bytes 4-7).  The bytes I see are: "+bytesToHex(scanData));
 			return null;
 		}
 								
@@ -248,10 +295,11 @@ public class IBeacon {
 		// 00 00 # major 
 		// 00 00 # minor 
 		// c5 # The 2's complement of the calibrated Tx Power
+
 		// Estimote:		
 		// 02 01 1a 11 07 2d 24 bf 16 
 		// 394b31ba3f486415ab376e5c0f09457374696d6f7465426561636f6e00000000000000000000000000000000000000000000000000
-		
+
 		byte[] proximityUuidBytes = new byte[16];
 		System.arraycopy(scanData, startByte+4, proximityUuidBytes, 0, 16); 
 		String hexString = bytesToHex(proximityUuidBytes);
@@ -267,6 +315,11 @@ public class IBeacon {
 		sb.append(hexString.substring(20,32));
 		iBeacon.proximityUuid = sb.toString();
 
+        if (device != null) {
+            iBeacon.bluetoothAddress = device.getAddress();
+        }
+
+
 		return iBeacon;
 	}
 	
@@ -279,9 +332,11 @@ public class IBeacon {
 		this.minor = otherIBeacon.minor;
 		this.accuracy = otherIBeacon.accuracy;
 		this.proximity = otherIBeacon.proximity;
+        this.runningAverageRssi = otherIBeacon.runningAverageRssi;
 		this.rssi = otherIBeacon.rssi;
 		this.proximityUuid = otherIBeacon.proximityUuid;
 		this.txPower = otherIBeacon.txPower;
+        this.bluetoothAddress = otherIBeacon.bluetoothAddress;
 	}
 	
 	protected IBeacon() {
@@ -289,7 +344,7 @@ public class IBeacon {
 	}
 
 	protected IBeacon(String proximityUuid, int major, int minor, int txPower, int rssi) {
-		this.proximityUuid = proximityUuid;
+		this.proximityUuid = proximityUuid.toLowerCase();
 		this.major = major;
 		this.minor = minor;
 		this.rssi = rssi;
@@ -297,7 +352,7 @@ public class IBeacon {
 	}
 	
 	public IBeacon(String proximityUuid, int major, int minor) {
-		this.proximityUuid = proximityUuid;
+		this.proximityUuid = proximityUuid.toLowerCase();
 		this.major = major;
 		this.minor = minor;
 		this.rssi = rssi;
@@ -310,7 +365,7 @@ public class IBeacon {
 			return -1.0; // if we cannot determine accuracy, return -1.
 		}
 		
-		if (IBeaconManager.LOG_DEBUG) Log.d(TAG, "calculating accuracy based on rssi of "+rssi);
+		if (IBeaconManager.debug) Log.d(TAG, "calculating accuracy based on rssi of "+rssi);
 
 
 		double ratio = rssi*1.0/txPower;
@@ -319,7 +374,7 @@ public class IBeacon {
 		}
 		else {
 			double accuracy =  (0.89976)*Math.pow(ratio,7.7095) + 0.111;	
-			if (IBeaconManager.LOG_DEBUG) Log.d(TAG, " avg rssi: "+rssi+" accuracy: "+accuracy);
+			if (IBeaconManager.debug) Log.d(TAG, " avg rssi: "+rssi+" accuracy: "+accuracy);
 			return accuracy;
 		}
 	}	

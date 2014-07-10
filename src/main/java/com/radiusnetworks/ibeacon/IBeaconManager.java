@@ -23,25 +23,24 @@
  */
 package com.radiusnetworks.ibeacon;
 
-import java.lang.ref.WeakReference;
+import java.util.ArrayList;
+import java.util.Collection;
 import java.util.HashMap;
 import java.util.Iterator;
 import java.util.Map;
 
-import com.radiusnetworks.ibeacon.client.RangingTracker;
-import com.radiusnetworks.ibeacon.service.IBeaconData;
+import com.radiusnetworks.ibeacon.simulator.BeaconSimulator;
 import com.radiusnetworks.ibeacon.service.IBeaconService;
-import com.radiusnetworks.ibeacon.service.RangingData;
 import com.radiusnetworks.ibeacon.service.RegionData;
 import com.radiusnetworks.ibeacon.service.StartRMData;
 
+import android.annotation.TargetApi;
 import android.bluetooth.BluetoothManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.content.ServiceConnection;
 import android.content.pm.PackageManager;
-import android.os.Handler;
 import android.os.IBinder;
 import android.os.Message;
 import android.os.Messenger;
@@ -93,6 +92,7 @@ import android.util.Log;
  * @author David G. Young
  *
  */
+@TargetApi(4)
 public class IBeaconManager {
 	private static final String TAG = "IBeaconManager";
 	private Context context;
@@ -100,13 +100,19 @@ public class IBeaconManager {
 	private Map<IBeaconConsumer,ConsumerInfo> consumers = new HashMap<IBeaconConsumer,ConsumerInfo>();
 	private Messenger serviceMessenger = null;
 	protected RangeNotifier rangeNotifier = null;
+    protected RangeNotifier dataRequestNotifier = null;
     protected MonitorNotifier monitorNotifier = null;
-    protected RangingTracker rangingTracker = new RangingTracker();
+    private ArrayList<Region> monitoredRegions = new ArrayList<Region>();
+    private ArrayList<Region> rangedRegions = new ArrayList<Region>();
+
     /**
      * set to true if you want to see debug messages associated with this library
      */
-    public static boolean LOG_DEBUG = false;
+    public static boolean debug = false;
 
+    public static void setDebug(boolean debug) {
+        IBeaconManager.debug = debug;
+    }
 
     /**
      * The default duration in milliseconds of the bluetooth scan cycle
@@ -131,21 +137,30 @@ public class IBeaconManager {
     private long backgroundBetweenScanPeriod = DEFAULT_BACKGROUND_BETWEEN_SCAN_PERIOD;
 
     /**
-     * Sets the duration in milliseconds of each Bluetooth LE scan cycle to look for iBeacons
+     * Sets the duration in milliseconds of each Bluetooth LE scan cycle to look for iBeacons.
+     * This function is used to setup the period before calling {@link #bind}  or when switching
+     * between background/foreground. To have it effect on an already running scan (when the next
+     * cycle starts), call {@link #updateScanPeriods}
      * @param p
      */
-    public void setForegroundScanPeriod(long p) {
-        foregroundBetweenScanPeriod = p;
-    }
+    public void setForegroundScanPeriod(long p) { foregroundScanPeriod = p; }
+
     /**
-     * Sets the duration in milliseconds to wait between each bluetooth scan cycle used to look for iBeacons
+     * Sets the duration in milliseconds between each Bluetooth LE scan cycle to look for iBeacons.
+     * This function is used to setup the period before calling {@link #bind}  or when switching
+     * between background/foreground. To have it effect on an already running scan (when the next
+     * cycle starts), call {@link #updateScanPeriods}
      * @param p
      */
     public void setForegroundBetweenScanPeriod(long p) {
         foregroundBetweenScanPeriod = p;
     }
+
     /**
-     * Sets the duration in milliseconds of each Bluetooth LE scan cycle to look for iBeacons when no ranging/monitoring clients are in the foreground
+     * Sets the duration in milliseconds of each Bluetooth LE scan cycle to look for iBeacons.
+     * This function is used to setup the period before calling {@link #bind}  or when switching
+     * between background/foreground. To have it effect on an already running scan (when the next
+     * cycle starts), call {@link #updateScanPeriods}
      * @param p
      */
     public void setBackgroundScanPeriod(long p) {
@@ -165,7 +180,7 @@ public class IBeaconManager {
 	 */
 	public static IBeaconManager getInstanceForApplication(Context context) {
 		if (client == null) {
-			if (IBeaconManager.LOG_DEBUG) Log.d(TAG, "IBeaconManager instance creation");
+			if (IBeaconManager.debug) Log.d(TAG, "IBeaconManager instance creation");
 			client = new IBeaconManager(context);
 		}
 		return client;
@@ -176,10 +191,14 @@ public class IBeaconManager {
 	}
 	/**
 	 * Check if Bluetooth LE is supported by this Android device, and if so, make sure it is enabled.
-	 * Throws a BleNotAvailableException if Bluetooth LE is not supported.  (Note: The Android emulator will do this)
+	 * @throws  BleNotAvailableException if Bluetooth LE is not supported.  (Note: The Android emulator will do this)
 	 * @return false if it is supported and not enabled
 	 */
-	public boolean checkAvailability() {
+    @TargetApi(18)
+	public boolean checkAvailability() throws BleNotAvailableException {
+        if (android.os.Build.VERSION.SDK_INT < 18) {
+            throw new BleNotAvailableException("Bluetooth LE not supported by this device");
+        }
 		if (!context.getPackageManager().hasSystemFeature(PackageManager.FEATURE_BLUETOOTH_LE)) {
 			throw new BleNotAvailableException("Bluetooth LE not supported by this device"); 
 		}		
@@ -198,19 +217,25 @@ public class IBeaconManager {
 	 * @param consumer the <code>Activity</code> or <code>Service</code> that will receive the callback when the service is ready.
 	 */
 	public void bind(IBeaconConsumer consumer) {
-		if (consumers.keySet().contains(consumer)) {
-			if (IBeaconManager.LOG_DEBUG) Log.d(TAG, "This consumer is already bound");
-		}
-		else {
-			Log.d(TAG, "This consumer is not bound.  binding: "+consumer);
-			consumers.put(consumer, new ConsumerInfo());
-			Intent intent = new Intent(consumer.getApplicationContext(), IBeaconService.class);
-			consumer.bindService(intent, iBeaconServiceConnection, Context.BIND_AUTO_CREATE);
-			if (IBeaconManager.LOG_DEBUG) Log.d(TAG, "consumer count is now:"+consumers.size());
-            if (serviceMessenger != null) { // If the serviceMessenger is not null, that means we are able to make calls to the service
-                setBackgroundMode(consumer, false); // if we just bound, we assume we are not in the background.
+        if (android.os.Build.VERSION.SDK_INT < 18) {
+            Log.w(TAG, "Not supported prior to SDK 18.  Method invocation will be ignored");
+            return;
+        }
+        synchronized (consumers) {
+            if (consumers.keySet().contains(consumer)) {
+                if (IBeaconManager.debug) Log.d(TAG, "This consumer is already bound");
             }
- 		}
+            else {
+                if (IBeaconManager.debug) Log.d(TAG, "This consumer is not bound.  binding: "+consumer);
+                consumers.put(consumer, new ConsumerInfo());
+                Intent intent = new Intent(consumer.getApplicationContext(), IBeaconService.class);
+                consumer.bindService(intent, iBeaconServiceConnection, Context.BIND_AUTO_CREATE);
+                if (IBeaconManager.debug) Log.d(TAG, "consumer count is now:"+consumers.size());
+                if (serviceMessenger != null) { // If the serviceMessenger is not null, that means we are able to make calls to the service
+                    setBackgroundMode(consumer, false); // if we just bound, we assume we are not in the background.
+                }
+            }
+        }
 	}
 	
 	/**
@@ -220,19 +245,25 @@ public class IBeaconManager {
 	 * @param consumer the <code>Activity</code> or <code>Service</code> that no longer needs to use the service.
 	 */
 	public void unBind(IBeaconConsumer consumer) {
-		if (consumers.keySet().contains(consumer)) {
-			Log.d(TAG, "Unbinding");
-			consumer.unbindService(iBeaconServiceConnection);
-			consumers.remove(consumer);
-		}
-		else {
-			if (IBeaconManager.LOG_DEBUG) Log.d(TAG, "This consumer is not bound to: "+consumer);
-			if (IBeaconManager.LOG_DEBUG) Log.d(TAG, "Bound consumers: ");
-			for (int i = 0; i < consumers.size(); i++) {
-				Log.i(TAG, " "+consumers.get(i));
-			}
-		}
-	}
+        if (android.os.Build.VERSION.SDK_INT < 18) {
+            Log.w(TAG, "Not supported prior to SDK 18.  Method invocation will be ignored");
+            return;
+        }
+        synchronized(consumers) {
+            if (consumers.keySet().contains(consumer)) {
+                Log.d(TAG, "Unbinding");
+                consumer.unbindService(iBeaconServiceConnection);
+                consumers.remove(consumer);
+            }
+            else {
+                if (IBeaconManager.debug) Log.d(TAG, "This consumer is not bound to: "+consumer);
+                if (IBeaconManager.debug) Log.d(TAG, "Bound consumers: ");
+                for (int i = 0; i < consumers.size(); i++) {
+                    Log.i(TAG, " "+consumers.get(i));
+                }
+            }
+        }
+ 	}
 
     /**
      * Tells you if the passed iBeacon consumer is bound to the service
@@ -240,7 +271,9 @@ public class IBeaconManager {
      * @return
      */
     public boolean isBound(IBeaconConsumer consumer) {
-        return consumers.keySet().contains(consumer) && (serviceMessenger != null);
+        synchronized(consumers) {
+            return consumers.keySet().contains(consumer) && (serviceMessenger != null);
+        }
     }
 
     /**
@@ -266,16 +299,28 @@ public class IBeaconManager {
      * returns true if background mode is successfully set
      */
     public boolean setBackgroundMode(IBeaconConsumer consumer, boolean backgroundMode) {
-        try {
-            ConsumerInfo consumerInfo = consumers.get(consumer);
-            consumerInfo.isInBackground = backgroundMode;
-            consumers.put(consumer,consumerInfo);
-            setScanPeriods();
-            return true;
-        }
-        catch (RemoteException e) {
-            Log.e(TAG, "Failed to set background mode", e);
+        if (android.os.Build.VERSION.SDK_INT < 18) {
+            Log.w(TAG, "Not supported prior to SDK 18.  Method invocation will be ignored");
             return false;
+        }
+        synchronized(consumers) {
+            Log.i(TAG, "setBackgroundMode for consumer"+consumer+" to "+backgroundMode);
+            if (consumers.keySet().contains(consumer)) {
+                try {
+                    ConsumerInfo consumerInfo = consumers.get(consumer);
+                    consumerInfo.isInBackground = backgroundMode;
+                    updateScanPeriods();
+                    return true;
+                }
+                catch (RemoteException e) {
+                    Log.e(TAG, "Failed to set background mode", e);
+                    return false;
+                }
+            }
+            else {
+                if (IBeaconManager.debug) Log.d(TAG, "This consumer is not bound to: "+consumer);
+                return false;
+            }
         }
     }
 
@@ -323,7 +368,12 @@ public class IBeaconManager {
 	 * @see Region 
 	 * @param region
 	 */
+    @TargetApi(18)
 	public void startRangingBeaconsInRegion(Region region) throws RemoteException {
+        if (android.os.Build.VERSION.SDK_INT < 18) {
+            Log.w(TAG, "Not supported prior to SDK 18.  Method invocation will be ignored");
+            return;
+        }
         if (serviceMessenger == null) {
             throw new RemoteException("The IBeaconManager is not bound to the service.  Call iBeaconManager.bind(IBeaconConsumer consumer) and wait for a callback to onIBeaconServiceConnect()");
         }
@@ -331,6 +381,9 @@ public class IBeaconManager {
 		StartRMData obj = new StartRMData(new RegionData(region), callbackPackageName(), this.getScanPeriod(), this.getBetweenScanPeriod() );
 		msg.obj = obj;
 		serviceMessenger.send(msg);
+        synchronized (rangedRegions) {
+            rangedRegions.add((Region) region.clone());
+        }
 	}
 	/**
 	 * Tells the <code>IBeaconService</code> to stop looking for iBeacons that match the passed
@@ -342,7 +395,12 @@ public class IBeaconManager {
 	 * @see Region 
 	 * @param region
 	 */
+    @TargetApi(18)
 	public void stopRangingBeaconsInRegion(Region region) throws RemoteException {
+        if (android.os.Build.VERSION.SDK_INT < 18) {
+            Log.w(TAG, "Not supported prior to SDK 18.  Method invocation will be ignored");
+            return;
+        }
         if (serviceMessenger == null) {
             throw new RemoteException("The IBeaconManager is not bound to the service.  Call iBeaconManager.bind(IBeaconConsumer consumer) and wait for a callback to onIBeaconServiceConnect()");
         }
@@ -350,6 +408,15 @@ public class IBeaconManager {
 		StartRMData obj = new StartRMData(new RegionData(region), callbackPackageName(),this.getScanPeriod(), this.getBetweenScanPeriod() );
 		msg.obj = obj;
 		serviceMessenger.send(msg);
+        synchronized (rangedRegions) {
+            Region regionToRemove = null;
+            for (Region rangedRegion : rangedRegions) {
+                if (region.getUniqueId().equals(rangedRegion.getUniqueId())) {
+                    regionToRemove = rangedRegion;
+                }
+            }
+            rangedRegions.remove(regionToRemove);
+        }
 	}
 	/**
 	 * Tells the <code>IBeaconService</code> to start looking for iBeacons that match the passed
@@ -362,7 +429,12 @@ public class IBeaconManager {
 	 * @see Region 
 	 * @param region
 	 */
+    @TargetApi(18)
 	public void startMonitoringBeaconsInRegion(Region region) throws RemoteException {
+        if (android.os.Build.VERSION.SDK_INT < 18) {
+            Log.w(TAG, "Not supported prior to API 18.  Method invocation will be ignored");
+            return;
+        }
         if (serviceMessenger == null) {
             throw new RemoteException("The IBeaconManager is not bound to the service.  Call iBeaconManager.bind(IBeaconConsumer consumer) and wait for a callback to onIBeaconServiceConnect()");
         }
@@ -370,6 +442,9 @@ public class IBeaconManager {
 		StartRMData obj = new StartRMData(new RegionData(region), callbackPackageName(),this.getScanPeriod(), this.getBetweenScanPeriod()  );
 		msg.obj = obj;
 		serviceMessenger.send(msg);
+        synchronized (monitoredRegions) {
+            monitoredRegions.add((Region) region.clone());
+        }
 	}
 	/**
 	 * Tells the <code>IBeaconService</code> to stop looking for iBeacons that match the passed
@@ -382,7 +457,12 @@ public class IBeaconManager {
 	 * @see Region 
 	 * @param region
 	 */
+    @TargetApi(18)
 	public void stopMonitoringBeaconsInRegion(Region region) throws RemoteException {
+        if (android.os.Build.VERSION.SDK_INT < 18) {
+            Log.w(TAG, "Not supported prior to API 18.  Method invocation will be ignored");
+            return;
+        }
         if (serviceMessenger == null) {
             throw new RemoteException("The IBeaconManager is not bound to the service.  Call iBeaconManager.bind(IBeaconConsumer consumer) and wait for a callback to onIBeaconServiceConnect()");
         }
@@ -390,46 +470,77 @@ public class IBeaconManager {
 		StartRMData obj = new StartRMData(new RegionData(region), callbackPackageName(),this.getScanPeriod(), this.getBetweenScanPeriod() );
 		msg.obj = obj;
 		serviceMessenger.send(msg);
+        synchronized (monitoredRegions) {
+            Region regionToRemove = null;
+            for (Region monitoredRegion : monitoredRegions) {
+                if (region.getUniqueId().equals(monitoredRegion.getUniqueId())) {
+                    regionToRemove = monitoredRegion;
+                }
+            }
+            monitoredRegions.remove(regionToRemove);
+        }
 	}
 
-    public void setScanPeriods() throws RemoteException {
+
+    /**
+     Updates an already running scan with scanPeriod/betweenScanPeriod according to Background/Foreground state.
+     Change will take effect on the start of the next scan cycle.
+     @throws RemoteException - If the IBeaconManager is not bound to the service.
+     */ 
+    @TargetApi(18)
+    public void updateScanPeriods() throws RemoteException {
+        if (android.os.Build.VERSION.SDK_INT < 18) {
+            Log.w(TAG, "Not supported prior to API 18.  Method invocation will be ignored");
+            return;
+        }
         if (serviceMessenger == null) {
             throw new RemoteException("The IBeaconManager is not bound to the service.  Call iBeaconManager.bind(IBeaconConsumer consumer) and wait for a callback to onIBeaconServiceConnect()");
         }
         Message msg = Message.obtain(null, IBeaconService.MSG_SET_SCAN_PERIODS, 0, 0);
+        Log.d(TAG, "updating scan period to "+this.getScanPeriod()+", "+this.getBetweenScanPeriod() );
         StartRMData obj = new StartRMData(this.getScanPeriod(), this.getBetweenScanPeriod());
         msg.obj = obj;
-        serviceMessenger.send(msg);
+        serviceMessenger.send(msg);        
+    }
+
+    /**
+     * @deprecated Use updateScanPeriods()
+     * @throws RemoteException
+     */
+    public void setScanPeriods() throws RemoteException {
+        updateScanPeriods();
     }
 	
 	private String callbackPackageName() {
 		String packageName = context.getPackageName();
-		if (IBeaconManager.LOG_DEBUG) Log.d(TAG, "callback packageName: "+packageName);
+		if (IBeaconManager.debug) Log.d(TAG, "callback packageName: "+packageName);
 		return packageName;
 	}
 
 	private ServiceConnection iBeaconServiceConnection = new ServiceConnection() {
 		// Called when the connection with the service is established
 	    public void onServiceConnected(ComponentName className, IBinder service) {
-	    	Log.d(TAG,  "we have a connection to the service now");
+            if (IBeaconManager.debug) Log.d(TAG,  "we have a connection to the service now");
 	        serviceMessenger = new Messenger(service);
-	        Iterator<IBeaconConsumer> consumerIterator = consumers.keySet().iterator();
-	        while (consumerIterator.hasNext()) {
-	        	IBeaconConsumer consumer = consumerIterator.next();
-	        	Boolean alreadyConnected = consumers.get(consumer).isConnected;
-	        	if (!alreadyConnected) {		        	
-		        	consumer.onIBeaconServiceConnect();
-                    ConsumerInfo consumerInfo = consumers.get(consumer);
-                    consumerInfo.isConnected = true;
-		        	consumers.put(consumer,consumerInfo);
-	        	}
-	        }
+            synchronized(consumers) {
+                Iterator<IBeaconConsumer> consumerIterator = consumers.keySet().iterator();
+                while (consumerIterator.hasNext()) {
+                    IBeaconConsumer consumer = consumerIterator.next();
+                    Boolean alreadyConnected = consumers.get(consumer).isConnected;
+                    if (!alreadyConnected) {
+                        consumer.onIBeaconServiceConnect();
+                        ConsumerInfo consumerInfo = consumers.get(consumer);
+                        consumerInfo.isConnected = true;
+                        consumers.put(consumer,consumerInfo);
+                    }
+                }
+            }
 	    }
 
 	    // Called when the connection with the service disconnects unexpectedly
 	    public void onServiceDisconnected(ComponentName className) {
-	        Log.e(TAG, "onServiceDisconnected");
-	    }
+            Log.e(TAG, "onServiceDisconnected");
+        }
 	};	
 
     /**
@@ -447,6 +558,45 @@ public class IBeaconManager {
 		return this.rangeNotifier;		
 	}
 
+    /**
+     * @return the list of regions currently being monitored
+     */
+    public Collection<Region> getMonitoredRegions() {
+        ArrayList<Region> clonedMontoredRegions = new ArrayList<Region>();
+        synchronized(this.monitoredRegions) {
+            for (Region montioredRegion : this.monitoredRegions) {
+                clonedMontoredRegions.add((Region) montioredRegion.clone());
+            }
+        }
+        return clonedMontoredRegions;
+    }
+
+    /**
+     * @return the list of regions currently being ranged
+     */
+    public Collection<Region> getRangedRegions() {
+        ArrayList<Region> clonedRangedRegions = new ArrayList<Region>();
+        synchronized(this.rangedRegions) {
+            for (Region rangedRegion : this.rangedRegions) {
+                clonedRangedRegions.add((Region) rangedRegion.clone());
+            }
+        }
+        return clonedRangedRegions;
+    }
+
+    protected static BeaconSimulator beaconSimulator;
+
+    public static void setBeaconSimulator(BeaconSimulator beaconSimulator) {
+        IBeaconManager.beaconSimulator = beaconSimulator;
+    }
+    public static BeaconSimulator getBeaconSimulator() {
+        return IBeaconManager.beaconSimulator;
+    }
+
+
+    protected void setDataRequestNotifier(RangeNotifier notifier) { this.dataRequestNotifier = notifier; }
+    protected RangeNotifier getDataRequestNotifier() { return this.dataRequestNotifier; }
+
     private class ConsumerInfo {
         public boolean isConnected = false;
         public boolean isInBackground = false;
@@ -454,11 +604,15 @@ public class IBeaconManager {
 
     private boolean isInBackground() {
         boolean background = true;
-        for (IBeaconConsumer consumer : consumers.keySet()) {
-            if (!consumers.get(consumer).isInBackground) {
-                background = false;
+        synchronized(consumers) {
+            for (IBeaconConsumer consumer : consumers.keySet()) {
+                if (!consumers.get(consumer).isInBackground) {
+                    background = false;
+                }
+                if (debug) Log.d(TAG, "Consumer "+consumer+" isInBackground="+consumers.get(consumer).isInBackground);
             }
         }
+        if (debug) Log.d(TAG, "Overall background mode is therefore "+background);
         return background;
     }
 
